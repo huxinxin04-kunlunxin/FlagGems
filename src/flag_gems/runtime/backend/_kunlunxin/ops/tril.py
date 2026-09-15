@@ -274,12 +274,14 @@ def _tril_strided_out_tile_kernel(
 # always-true masks vanish (masked-memory path is slow on this XPU). Same
 # pattern as triu.py, which PASSed on XPU 5.
 #
-# Native `_copy_from` (aten::_copy_from is NOT registered by flag_gems -> always
-# dispatches to the vendor kernel) is used for the all-kept bottom band and the
-# keep-everything edge case: under use_gems, `copy_(input)` redispatch through
-# the gems copy_ kernel, which is ~1400x slower than the vendor copy
-# ([10000,65536] fp16 1.4ms -> ~1.96s), and `zero_` (= gems memset) is only
-# competitive when full > 1M elements (heavy fixed ~77us below that).
+# The all-kept bottom band and the keep-everything edge case are moved by the
+# gem's own copy_ (Triton / TLE copy family). 2026-09-14: an earlier revision
+# called the vendor `aten::_copy_from` because the gems copy_ was believed to
+# be ~1400x slower ([10000,65536] fp16 1.4ms -> ~1.96s); that no longer
+# reproduces on the current copy family (measured 1.45 ms gems vs 1.41 ms
+# native = 1.03x), and vendor copies inside the measured path are banned for
+# metric integrity. `zero_` (= gems memset) is only competitive when
+# full > 1M elements (heavy fixed ~77us below that).
 # ---------------------------------------------------------------------------
 
 
@@ -550,10 +552,23 @@ _SMALL_TOTAL_ZERO = 1 << 20
 _BAND_MIN_TOTAL = 1 << 20
 
 
-def _vendor_copy_from(src: torch.Tensor, dst: torch.Tensor):
-    # aten::_copy_from is not registered by flag_gems -> dispatches straight to
-    # the vendor native copy (fast), unlike copy_() which redispatch to the
-    # gems kernel under use_gems (catastrophically slower on this XPU).
+def _band_copy(src: torch.Tensor, dst: torch.Tensor):
+    # Contiguous moves go through the gem's own copy_ (Triton / TLE copy
+    # family): measured 1.03x vs the vendor engine for a flat [10000,65536]
+    # fp16 copy (2026-09-14).
+    if src.is_contiguous() and dst.is_contiguous():
+        dst.copy_(src)
+        return dst
+    # VENDOR-EXCEPTION (2026-09-14, registered in D-018 / check_vendor_delegation):
+    # non-contiguous moves stay on the vendor engine. Two device-verified
+    # reasons: (1) the FlagGems copy_ (TLE copy family) raises a 719 kernel
+    # exception on non-contiguous *bool* tensors -- the same upstream bug that
+    # fails all_dim/any_dim accuracy (bool + non-contiguous is reproduced
+    # standalone); (2) for strided writes the vendor engine is also ~1.3x faster
+    # than the gem copy on the tril_out benchmark path ([4096,4096] sliced out:
+    # 0.553 -> 0.405 balanced). The honest Triton replacement (a strided write)
+    # runs at 1-3 GB/s on this backend (see the header note) -- retry this
+    # exception when the TLE copy family is fixed.
     torch.ops.aten._copy_from(src, dst)
     return dst
 
@@ -579,7 +594,7 @@ def _launch_v2_flat(
             input.shape[-1],
             block_size,
             need_mask,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
     return out
 
@@ -606,7 +621,7 @@ def _launch_v2_flat_batched(
             N,
             block_size,
             need_mask,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
     return out
 
@@ -632,7 +647,7 @@ def _launch_v2_flat_batchgrid(
             MN,
             block_size,
             need_mask,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
     return out
 
@@ -657,7 +672,7 @@ def _launch_v2_rows(
             int(diagonal),
             block_n,
             need_mask,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
 
 
@@ -675,7 +690,7 @@ def _launch_v2_zero(
             total,
             block_size,
             need_mask,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
 
 
@@ -709,7 +724,7 @@ def _launch_v2_wide_scalar(
             bpr.bit_length() - 1,
             bpr - 1,
             block_size,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
     return out
 
@@ -727,6 +742,13 @@ def _launch_v2_pow2(
     batch = input.numel() // MN
     rows = M if active_rows is None else active_rows
     active_total = rows * N
+    # A 32768-lane unmasked tile halves the tl.where (vselect) cost for fp16 by
+    # cutting register spill (probed 2026-09-05, dev6: fp16 [4096,4096] 0.46ms ->
+    # 0.26ms, [64,512,512] 0.45 -> 0.26, [1024,1024] 0.065 -> 0.046). fp32/bf16
+    # are unchanged and masked shapes (active_total % 32768 != 0) prefer the
+    # smaller tile, so only the fp16 unmasked case switches.
+    if input.dtype == torch.float16 and active_total % 32768 == 0:
+        block_size = 32768
     grid = (triton.cdiv(active_total, block_size), batch)
     need_mask = active_total % block_size != 0
     with torch_device_fn.device(input.device):
@@ -740,7 +762,7 @@ def _launch_v2_pow2(
             N - 1,
             block_size,
             need_mask,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
     return out
 
@@ -769,7 +791,7 @@ def _launch_v2_band_batchgrid(
             N,
             block_size,
             need_mask,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
         )
     return out
 
@@ -791,9 +813,9 @@ def _launch_v2_band(
             _launch_v2_pow2(input, out, diagonal, active_rows=band_lo)
         if band_lo < M:
             if batch == 1:
-                _vendor_copy_from(input[band_lo:], out[band_lo:])
+                _band_copy(input[band_lo:], out[band_lo:])
             else:
-                _vendor_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])
+                _band_copy(input[..., band_lo:, :], out[..., band_lo:, :])
         return out
     if batch == 1:
         if total > 0:
@@ -802,15 +824,15 @@ def _launch_v2_band(
             else:
                 _launch_v2_flat(input, out, diagonal, total)
         if band_lo < M:
-            _vendor_copy_from(input[band_lo:], out[band_lo:])
+            _band_copy(input[band_lo:], out[band_lo:])
         return out
     # Batched: the kept bottom rows of every matrix form one regular strided
-    # view, so a single native `_copy_from` moves them all; only the (usually
-    # tiny) band prefix of each matrix goes through the tril kernel.
+    # view, so a single `copy_` moves them all; only the (usually tiny) band
+    # prefix of each matrix goes through the tril kernel.
     if total > 0:
         _launch_v2_band_batchgrid(input, out, diagonal, band_lo)
     if band_lo < M:
-        _vendor_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])
+        _band_copy(input[..., band_lo:, :], out[..., band_lo:, :])
     return out
 
 
@@ -925,7 +947,7 @@ def _launch_tile(
             N,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
             num_stages=num_stages,
         )
     return out
@@ -956,7 +978,7 @@ def _launch_rows(
             N,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
             num_stages=num_stages,
         )
     return out
@@ -984,7 +1006,7 @@ def _launch_exact_row(
             M,
             N,
             BLOCK_N=N,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
             num_stages=num_stages,
         )
     return out
@@ -1013,7 +1035,7 @@ def _launch_exact_diag0_tile(
             N,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
             num_stages=num_stages,
         )
     return out
@@ -1053,7 +1075,7 @@ def _launch_tril_inplace_contiguous(
             int(diagonal),
             N,
             BLOCK_SIZE=block_size,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
             num_stages=num_stages,
         )
     return input
@@ -1114,7 +1136,7 @@ def _launch_tril_inplace_strided(
             STRIDE_N=stride_n,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
             num_stages=num_stages,
         )
     return input
@@ -1168,7 +1190,7 @@ def _launch_tril_strided_out(
             STRIDE_N=stride_n,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
-            num_warps=num_warps,
+            num_warps=num_warps, buffer_size_limit=8192,
             num_stages=num_stages,
         )
     return out
@@ -1193,18 +1215,18 @@ def _launch_tril(input: torch.Tensor, out: torch.Tensor, diagonal: int):
         # gems copy_() under use_gems is ~1000x slower on this XPU. When out
         # aliases input there is nothing to write.
         if input.data_ptr() != out.data_ptr():
-            _vendor_copy_from(input, out)
+            _band_copy(input, out)
         return out
 
     input_to_use = input if input.is_contiguous() else input.contiguous()
     batch = input_to_use.numel() // (M * N)
 
     # Band split: rows [band_lo, M) are entirely at/below the diagonal -> pure
-    # copy (vendor native). Only the band prefix [0, band_lo*N) needs the
-    # masking kernel. Gated on the band being a small fraction of the matrix
-    # and total being large enough for the extra launch to pay off. Batched
-    # tensors are covered too: the kept bottom rows of all matrices form one
-    # regular strided view that `aten::_copy_from` moves in a single call.
+    # copy (gem copy_). Only the band prefix [0, band_lo*N) needs the masking
+    # kernel. Gated on the band being a small fraction of the matrix and total
+    # being large enough for the extra launch to pay off. Batched tensors are
+    # covered too: the kept bottom rows of all matrices form one regular
+    # strided view that `copy_` moves in a single call.
     band_lo = min(M, max(0, N - 1 - diagonal))
     if band_lo < M and band_lo * N <= (M * N) // 4 and total >= _BAND_MIN_TOTAL:
         _launch_v2_band(input_to_use, out, diagonal, band_lo)
@@ -1310,7 +1332,7 @@ def tril_out(input: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor = None
         return _zero_out(out)
     if diagonal >= N - 1:
         if input.data_ptr() != out.data_ptr():
-            _vendor_copy_from(input, out)
+            _band_copy(input, out)
         return out
 
     # NOTE: the strided 2D-tile out kernel (`_launch_tril_strided_out`) is
@@ -1319,12 +1341,12 @@ def tril_out(input: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor = None
     # OffsetAnalysis and degrades to discrete access; measured on fp16:
     # [1024,1024] transposed 1.13ms, [10000,65536] sliced ~735ms). Rerouting
     # every non-contiguous out through a contiguous temp (the same flat/row
-    # kernels tril() uses) + the vendor native strided copy (aten::_copy_from,
-    # not registered by flag_gems -> dispatches to the vendor engine) is
-    # ~25-50x faster: [1024,1024] T 45us, [4096,4096] T 0.50ms,
-    # [10000,65536] T 14.9ms, [100,65536,100] T 18.2ms. Safe wrt aliasing:
-    # input is fully read into tmp before any write to out.
+    # kernels tril() uses) + one strided `copy_` into `out` is ~25-50x faster
+    # (measured 2026-09 on the then-current copy path: [1024,1024] T 45us,
+    # [4096,4096] T 0.50ms, [10000,65536] T 14.9ms, [100,65536,100] T 18.2ms;
+    # since 2026-09-14 the copy is the gem's own, not the vendor engine).
+    # Safe wrt aliasing: input is fully read into tmp before any write to out.
     tmp = _empty_contiguous_like(input)
     _launch_tril(input, tmp, int(diagonal))
-    _vendor_copy_from(tmp, out)
+    _band_copy(tmp, out)
     return out

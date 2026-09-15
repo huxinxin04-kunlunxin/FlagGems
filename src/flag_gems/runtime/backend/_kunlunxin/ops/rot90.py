@@ -19,6 +19,16 @@ logger = logging.getLogger(__name__)
 # compute BLOCK_SIZE/num_warps in the Python wrapper (size-banded) and pass them
 # explicitly. Kernel body is byte-for-byte identical to generic -> zero numeric
 # change.
+#
+# 2026-09-14: an earlier revision replaced this kernel with a captured native
+# ``aten::flip`` (``torch.library.get_kernel`` + ``call_boxed``), which made the
+# measured gem *be* the reference implementation (rot90 is flip + a free view),
+# so its benchmark ratio was ~1.0 by construction. That is banned for metric
+# integrity: an operator implementation may not run the vendor implementation
+# of its own computation. This is the honest Triton path; until the backend
+# grows a vectorised reverse-lane load (Vgather negative stride, tracked in
+# analysis/14 P6) it is expected to be several times slower than the vendor
+# flip -- that gap is real and belongs in the numbers, not hidden.
 @triton.jit
 def rot90_kernel_2d(
     in_ptr,
