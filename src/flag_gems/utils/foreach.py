@@ -158,7 +158,7 @@ def group_by_device_dtype(
     return groups
 
 
-def _pick_block(numels: Sequence[int], max_programs: int = 1 << 18) -> int:
+def _pick_block(numels: Sequence[int], max_programs: int = 1 << 14) -> int:
     """Block size balancing per-program work against the 2D grid size.
 
     The grid is ``(len(numels), cdiv(max numel, block))``, so tensors smaller
@@ -170,8 +170,13 @@ def _pick_block(numels: Sequence[int], max_programs: int = 1 << 18) -> int:
     program pays three scalar ``int64`` metadata loads before it touches any
     data, so a small block amortises that fixed cost over too little work: on
     128 x 1M fp32 a sweep measured 339us at ``BLOCK=1024`` against 434us at 256,
-    and the ordering held across every shape tried.  1024 elements is also one
-    element per lane at ``num_warps=4``, which is why larger blocks stop helping.
+    where 1024 elements is one element per lane at ``num_warps=4``.  That sweep
+    did not explore blocks above 1024 -- and on XPU they help a lot: 16 x
+    4096x4096 fp16 took 207.5ms at 1024 versus 12.0ms at 16384 (5.2 -> 89.5 GB/s).
+
+    ``max_programs`` has to be small enough to actually bind -- at 2**18 it
+    exceeded any plausible device's parallel-unit count by orders of magnitude,
+    so the ladder rarely advanced past its 1024 floor.
     """
     nt = len(numels)
     max_numel = max(numels)
