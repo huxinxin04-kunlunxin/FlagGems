@@ -59,21 +59,24 @@ def _trsm_slice_xpu_kernel(
     abase = bidx * N * rsa
     bbase = bidx * N * csb + sidx * KS
     cc = tl.arange(0, KS)
-    cm = cc < K
+    # No mask on this column slice: the host pads K to a multiple of KS
+    # (kpad = ceil(k/KS)*KS >= KS for k >= 1), so `cc < K` is structurally
+    # true for every input; k == 0 cannot reach here (B.numel() == 0 is
+    # returned early by linalg_solve_triangular).
     for t in range(N):
         row = N - 1 - t if UPPER else t
         if F64:
-            acc_h = tl.load(Bh_ptr + bbase + row * csb + cc, mask=cm, other=0.0)
-            acc_l = tl.load(Bl_ptr + bbase + row * csb + cc, mask=cm, other=0.0)
+            acc_h = tl.load(Bh_ptr + bbase + row * csb + cc)
+            acc_l = tl.load(Bl_ptr + bbase + row * csb + cc)
         else:
-            acc = tl.load(B_ptr + bbase + row * csb + cc, mask=cm, other=0.0)
+            acc = tl.load(B_ptr + bbase + row * csb + cc)
         for u in range(t):
             j = N - 1 - u if UPPER else u
             if F64:
                 ah = tl.load(Ah_ptr + abase + row * rsa + j)
                 al = tl.load(Al_ptr + abase + row * rsa + j)
-                xh = tl.load(Bh_ptr + bbase + j * csb + cc, mask=cm, other=0.0)
-                xl = tl.load(Bl_ptr + bbase + j * csb + cc, mask=cm, other=0.0)
+                xh = tl.load(Bh_ptr + bbase + j * csb + cc)
+                xl = tl.load(Bl_ptr + bbase + j * csb + cc)
                 sp = 8193.0
                 ca = ah * sp
                 ab = ca - ah
@@ -94,7 +97,7 @@ def _trsm_slice_xpu_kernel(
                 acc_h = s
             else:
                 a = tl.load(A_ptr + abase + row * rsa + j)
-                x = tl.load(B_ptr + bbase + j * csb + cc, mask=cm, other=0.0)
+                x = tl.load(B_ptr + bbase + j * csb + cc)
                 acc = acc - a * x
         if F64:
             out_h = acc_h
@@ -109,14 +112,14 @@ def _trsm_slice_xpu_kernel(
                 q2 = r / dh
                 out_h = q1 + q2
                 out_l = (q1 - out_h) + q2
-            tl.store(Bh_ptr + bbase + row * csb + cc, out_h, mask=cm)
-            tl.store(Bl_ptr + bbase + row * csb + cc, out_l, mask=cm)
+            tl.store(Bh_ptr + bbase + row * csb + cc, out_h)
+            tl.store(Bl_ptr + bbase + row * csb + cc, out_l)
         else:
             xv = acc
             if not UNIT:
                 d = tl.load(A_ptr + abase + row * rsa + row)
                 xv = xv * (1.0 / d)
-            tl.store(B_ptr + bbase + row * csb + cc, xv, mask=cm)
+            tl.store(B_ptr + bbase + row * csb + cc, xv)
 
 
 def _expand_fp64_inputs(A, B):
@@ -157,17 +160,20 @@ def _trsm_update_xpu_kernel(
     abase = bidx * N * rsa
     bbase = bidx * N * csb + sidx * KS
     cc = tl.arange(0, KS)
-    cm = cc < K
+    # No mask on this column slice: the host pads K to a multiple of KS
+    # (kpad = ceil(k/KS)*KS >= KS for k >= 1), so `cc < K` is structurally
+    # true for every input; k == 0 cannot reach here (B.numel() == 0 is
+    # returned early by linalg_solve_triangular).
     t = R0 + rl
     row = N - 1 - t if UPPER else t
-    acc = tl.load(B_ptr + bbase + row * csb + cc, mask=cm, other=0.0)
+    acc = tl.load(B_ptr + bbase + row * csb + cc)
     arow = A_ptr + abase + row * rsa
     for u in range(R0):
         j = N - 1 - u if UPPER else u
         a = tl.load(arow + j)
-        x = tl.load(B_ptr + bbase + j * csb + cc, mask=cm, other=0.0)
+        x = tl.load(B_ptr + bbase + j * csb + cc)
         acc = acc - a * x
-    tl.store(B_ptr + bbase + row * csb + cc, acc, mask=cm)
+    tl.store(B_ptr + bbase + row * csb + cc, acc)
 
 
 @libentry()
@@ -198,21 +204,24 @@ def _trsm_diag_xpu_kernel(
     abase = bidx * N * rsa
     bbase = bidx * N * csb + sidx * KS
     cc = tl.arange(0, KS)
-    cm = cc < K
+    # No mask on this column slice: the host pads K to a multiple of KS
+    # (kpad = ceil(k/KS)*KS >= KS for k >= 1), so `cc < K` is structurally
+    # true for every input; k == 0 cannot reach here (B.numel() == 0 is
+    # returned early by linalg_solve_triangular).
     for q in range(BR):
         t = R0 + q
         row = N - 1 - t if UPPER else t
-        acc = tl.load(B_ptr + bbase + row * csb + cc, mask=cm, other=0.0)
+        acc = tl.load(B_ptr + bbase + row * csb + cc)
         arow = A_ptr + abase + row * rsa
         for u in range(R0, t):
             j = N - 1 - u if UPPER else u
             a = tl.load(arow + j)
-            x = tl.load(B_ptr + bbase + j * csb + cc, mask=cm, other=0.0)
+            x = tl.load(B_ptr + bbase + j * csb + cc)
             acc = acc - a * x
         if not UNIT:
             d = tl.load(arow + row)
             acc = acc * (1.0 / d)
-        tl.store(B_ptr + bbase + row * csb + cc, acc, mask=cm)
+        tl.store(B_ptr + bbase + row * csb + cc, acc)
 
 
 @libentry()
