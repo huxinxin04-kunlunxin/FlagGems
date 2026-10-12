@@ -101,7 +101,7 @@ def _launch_special_i0(out: torch.Tensor, x: torch.Tensor):
     # BLOCK_SIZE fixed at 1024: a common power-of-two tile that saturates
     # memory bandwidth for this elementwise kernel without autotuning.
     BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
 
     _special_i0_kernel[grid](x_contig, out_contig, n_elements, BLOCK_SIZE=BLOCK_SIZE)
 
