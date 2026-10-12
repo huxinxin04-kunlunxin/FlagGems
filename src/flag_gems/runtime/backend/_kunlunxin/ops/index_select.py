@@ -65,6 +65,7 @@ def index_select_slice_kernel(
     INNER,
     IDXL,
     BLOCK_I: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     # One program per output slice. Each slice copies INNER contiguous
     # elements: out[o, j, :] = inp[o, index[j], :]. Because the copied
@@ -82,9 +83,15 @@ def index_select_slice_kernel(
     out += pid * INNER
     for c in range(0, INNER, BLOCK_I):
         cols = c + tl.arange(0, BLOCK_I)
-        mask = cols < INNER
-        vals = tl.load(inp + cols, mask=mask, other=0)
-        tl.store(out + cols, vals, mask=mask)
+        # A runtime-invariant mask still forces the slow masked memory path, so
+        # drop it entirely when every chunk is full.
+        if NEED_MASK:
+            mask = cols < INNER
+            vals = tl.load(inp + cols, mask=mask, other=0)
+            tl.store(out + cols, vals, mask=mask)
+        else:
+            vals = tl.load(inp + cols)
+            tl.store(out + cols, vals)
 
 
 def index_select(inp, dim, index):
@@ -120,6 +127,7 @@ def index_select(inp, dim, index):
             inner,
             index_len,
             BLOCK_I=block_i,
+            NEED_MASK=inner % block_i != 0,
             num_warps=8,
             buffer_size_limit=4096,
         )
