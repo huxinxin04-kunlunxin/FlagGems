@@ -29,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+import flag_gems
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -158,7 +160,7 @@ def group_by_device_dtype(
     return groups
 
 
-def _pick_block(numels: Sequence[int], max_programs: int = 1 << 18) -> int:
+def _pick_block(numels: Sequence[int], max_programs: int = 1 << 12) -> int:
     """Block size balancing per-program work against the 2D grid size.
 
     The grid is ``(len(numels), cdiv(max numel, block))``, so tensors smaller
@@ -170,15 +172,32 @@ def _pick_block(numels: Sequence[int], max_programs: int = 1 << 18) -> int:
     program pays three scalar ``int64`` metadata loads before it touches any
     data, so a small block amortises that fixed cost over too little work: on
     128 x 1M fp32 a sweep measured 339us at ``BLOCK=1024`` against 434us at 256,
-    and the ordering held across every shape tried.  1024 elements is also one
-    element per lane at ``num_warps=4``, which is why larger blocks stop helping.
+    where 1024 elements is one element per lane at ``num_warps=4``.  That sweep
+    did not explore blocks above 1024 -- and on XPU they help a lot: 16 x
+    4096x4096 fp16 took 207.5ms at 1024 versus 12.0ms at 16384 (5.2 -> 89.5 GB/s).
+
+    ``max_programs`` has to be small enough to actually bind -- at 2**18 it
+    exceeded any plausible device's parallel-unit count by orders of magnitude,
+    so the ladder rarely advanced past its 1024 floor.
     """
     nt = len(numels)
     max_numel = max(numels)
-    for block in (1024, 2048, 4096, 8192, 16384):
+    for block in (1024, 2048, 4096, 8192, 16384, 32768, 65536):
         if nt * ((max_numel + block - 1) // block) <= max_programs:
             return block
-    return 16384
+    return 65536
+
+
+def _launch_options() -> Dict[str, int]:
+    """Backend launch options for the foreach kernels, evaluated per call.
+
+    On XPU the default 512-entry buffer caps the per-core tile, which pins the
+    bandwidth-bound foreach kernels at 0.47-0.66 of the torch reference; 4096
+    measures 0.83-0.87 on the batch-3 set (with the full-chunk mask dropped).
+    """
+    if flag_gems.vendor_name == "kunlunxin":
+        return {"buffer_size_limit": 4096}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +213,7 @@ def foreach_unary_kernel(
     IN_DT: tl.constexpr,
     OUT_DT: tl.constexpr,
     BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     """One launch, ``NT`` tensors.
 
@@ -217,14 +237,21 @@ def foreach_unary_kernel(
     n_elements = tl.load(meta_ptr + 2 * NT + t)
 
     idx = offset + tl.arange(0, BLOCK)
-    mask = idx < n_elements
-    x = tl.load(in_ptr + idx, mask=mask, other=0)
-    # The value is promoted to the output dtype *before* the math runs, which is
-    # what ``pointwise_dynamic`` does for its scalar functions.  Those functions
-    # commonly end in ``.to(x.dtype)``, so handing them an unpromoted integer
-    # would truncate the result: ``log1p`` on int64 measured 0.693 of error
-    # until the promotion was moved ahead of the call.
-    tl.store(out_ptr + idx, fn(x.to(OUT_DT)).to(OUT_DT), mask=mask)
+    if NEED_MASK:
+        mask = idx < n_elements
+        x = tl.load(in_ptr + idx, mask=mask, other=0)
+        # The value is promoted to the output dtype *before* the math runs, which is
+        # what ``pointwise_dynamic`` does for its scalar functions.  Those functions
+        # commonly end in ``.to(x.dtype)``, so handing them an unpromoted integer
+        # would truncate the result: ``log1p`` on int64 measured 0.693 of error
+        # until the promotion was moved ahead of the call.
+        tl.store(out_ptr + idx, fn(x.to(OUT_DT)).to(OUT_DT), mask=mask)
+    else:
+        # Every chunk is full (equal-length tensors, block-aligned): a
+        # runtime-invariant mask still forces the slow masked memory path, so
+        # drop it entirely -- and ``other`` with it, since no lane is masked.
+        x = tl.load(in_ptr + idx)
+        tl.store(out_ptr + idx, fn(x.to(OUT_DT)).to(OUT_DT))
 
 
 @triton.jit
@@ -391,6 +418,7 @@ def foreach_ternary_kernel(
     A_DT: tl.constexpr,
     OUT_DT: tl.constexpr,
     BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     """``NT`` tensors, three tensor inputs and one per-tensor scalar.
 
@@ -417,11 +445,19 @@ def foreach_ternary_kernel(
     s = tl.load(scalar_ptr + t)
 
     idx = offset + tl.arange(0, BLOCK)
-    mask = idx < n_elements
-    a = tl.load(a_ptr + idx, mask=mask, other=0).to(OUT_DT)
-    b = tl.load(b_ptr + idx, mask=mask, other=0).to(OUT_DT)
-    c = tl.load(c_ptr + idx, mask=mask, other=0).to(OUT_DT)
-    tl.store(out_ptr + idx, fn(a, b, c, s.to(OUT_DT)).to(OUT_DT), mask=mask)
+    if NEED_MASK:
+        mask = idx < n_elements
+        a = tl.load(a_ptr + idx, mask=mask, other=0).to(OUT_DT)
+        b = tl.load(b_ptr + idx, mask=mask, other=0).to(OUT_DT)
+        c = tl.load(c_ptr + idx, mask=mask, other=0).to(OUT_DT)
+        tl.store(out_ptr + idx, fn(a, b, c, s.to(OUT_DT)).to(OUT_DT), mask=mask)
+    else:
+        # Same rule as foreach_unary_kernel: full chunks only -> no mask, no
+        # ``other``, and the scalar staging zero-fill it forces goes away.
+        a = tl.load(a_ptr + idx).to(OUT_DT)
+        b = tl.load(b_ptr + idx).to(OUT_DT)
+        c = tl.load(c_ptr + idx).to(OUT_DT)
+        tl.store(out_ptr + idx, fn(a, b, c, s.to(OUT_DT)).to(OUT_DT))
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +536,11 @@ def _launch_group(
     meta = meta_cpu.to(device, non_blocking=True)
 
     grid = (nt, triton.cdiv(max_numel, block))
+    # Full chunks only -> drop the runtime-invariant mask (and the slow masked
+    # memory path it forces). Equal length matters as much as alignment: a
+    # shorter tensor's chunks past its own count are skipped by the mask.
+    need_mask = not (len(set(numels)) == 1 and max_numel % block == 0)
+    options = _launch_options()
     if is_complex:
         real_dtype = _COMPLEX_TO_REAL[in_dtype]
         acc = tl.float32 if real_dtype is not torch.float64 else tl.float64
@@ -508,10 +549,17 @@ def _launch_group(
             if dsts[0].dtype.is_floating_point
             else foreach_unary_c2c_kernel
         )
-        kernel[grid](meta, fn, nt, tl_dtype(real_dtype), acc, block)
+        kernel[grid](meta, fn, nt, tl_dtype(real_dtype), acc, block, **options)
     else:
         foreach_unary_kernel[grid](
-            meta, fn, nt, tl_dtype(in_dtype), tl_dtype(dsts[0].dtype), block
+            meta,
+            fn,
+            nt,
+            tl_dtype(in_dtype),
+            tl_dtype(dsts[0].dtype),
+            block,
+            need_mask,
+            **options,
         )
     _STATS.executor_launches += 1
     _STATS.groups += 1
@@ -1050,8 +1098,18 @@ def _launch_ternary_group(
         device, non_blocking=True
     )
     grid = (nt, triton.cdiv(max_numel, block))
+    # Same full-chunks rule as the unary launcher (see _launch_group).
+    need_mask = not (len(set(numels)) == 1 and max_numel % block == 0)
     foreach_ternary_kernel[grid](
-        meta, scalar_buf, fn, nt, tl_dtype(in_dt), tl_dtype(out_dt), block
+        meta,
+        scalar_buf,
+        fn,
+        nt,
+        tl_dtype(in_dt),
+        tl_dtype(out_dt),
+        block,
+        need_mask,
+        **_launch_options(),
     )
     _STATS.executor_launches += 1
     _STATS.groups += 1

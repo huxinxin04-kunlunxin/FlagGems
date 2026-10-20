@@ -89,7 +89,7 @@ def _run_special_i1e_kernel(x: torch.Tensor, out: torch.Tensor):
     if n_elements == 0:
         return out
 
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = (triton.cdiv(n_elements, 1024),)
     _special_i1e_kernel[grid](x_c, out_c, n_elements, BLOCK_SIZE=1024)
 
     if out_c.data_ptr() != out.data_ptr():

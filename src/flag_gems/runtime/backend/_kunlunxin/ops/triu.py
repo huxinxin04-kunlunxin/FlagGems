@@ -70,15 +70,17 @@ def _triu_flat_kernel(
     rows = matrix_offsets // N
     cols = matrix_offsets - rows * N
     keep = cols >= rows + diag
+    # Zero in x's own dtype: a python 0.0 is an f32 constant, which promotes
+    # f16/bf16 through f32 (vextf/vselect/vtruncf) on this backend.
 
     if NEED_MASK:
         mask = offsets < total
         x = tl.load(in_ptr + offsets, mask=mask, other=0.0)
-        y = tl.where(keep, x, 0.0)
+        y = tl.where(keep, x, tl.zeros(x.shape, x.dtype))
         tl.store(out_ptr + offsets, y, mask=mask)
     else:
         x = tl.load(in_ptr + offsets)
-        y = tl.where(keep, x, 0.0)
+        y = tl.where(keep, x, tl.zeros(x.shape, x.dtype))
         tl.store(out_ptr + offsets, y)
 
 
@@ -105,11 +107,11 @@ def _triu_flat_2d_kernel(
     if NEED_MASK:
         mask = offsets < total
         x = tl.load(in_ptr + offsets, mask=mask, other=0.0)
-        y = tl.where(keep, x, 0.0)
+        y = tl.where(keep, x, tl.zeros(x.shape, x.dtype))
         tl.store(out_ptr + offsets, y, mask=mask)
     else:
         x = tl.load(in_ptr + offsets)
-        y = tl.where(keep, x, 0.0)
+        y = tl.where(keep, x, tl.zeros(x.shape, x.dtype))
         tl.store(out_ptr + offsets, y)
 
 
@@ -195,10 +197,16 @@ def _triu_row_kernel(
         if NEED_MASK:
             m = cols < N
             x = tl.load(in_ptr + base + cols, mask=m, other=0.0)
-            tl.store(out_ptr + base + cols, tl.where(keep, x, 0.0), mask=m)
+            tl.store(
+                out_ptr + base + cols,
+                tl.where(keep, x, tl.zeros(x.shape, x.dtype)),
+                mask=m,
+            )
         else:
             x = tl.load(in_ptr + base + cols)
-            tl.store(out_ptr + base + cols, tl.where(keep, x, 0.0))
+            tl.store(
+                out_ptr + base + cols, tl.where(keep, x, tl.zeros(x.shape, x.dtype))
+            )
 
 
 # Large flat tiles hide the div/where compute better than small ones on this XPU

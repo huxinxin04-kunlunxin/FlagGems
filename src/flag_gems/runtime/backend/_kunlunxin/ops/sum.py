@@ -392,7 +392,7 @@ def _tle_sum_dim(inp, out, M, N, scale=1.0):
     return True
 
 
-def _tle_sum_flat(inp, out, acc_dtype):
+def _tle_sum_flat(inp, out, acc_dtype, scale=1.0):
     """Full reduction as repeated row-reduces of a [n // COLS, COLS] view.
 
     Feeding the output back in is the whole algorithm: 1G elements go 1G -> 262144 in
@@ -402,6 +402,9 @@ def _tle_sum_flat(inp, out, acc_dtype):
     exact but leaves 63 cores idle, so it is only ever handed a small residue. A
     `n % COLS` residue is not reduced: it is carried into the next stage's buffer as-is,
     which costs a copy of under COLS elements and saves a launch.
+
+    `scale` multiplies the result (mean = sum * (1/n)) and is applied on the final
+    stage only -- the intermediate stages must stay unscaled or it compounds.
 
     Returns False without touching `out` only when the dtype or the layout is out of
     reach; any size is in reach.
@@ -440,9 +443,11 @@ def _tle_sum_flat(inp, out, acc_dtype):
         if n < 2:
             # A single element (or none) is a copy; `out` is 0-d or (1,).
             out.view(-1).copy_(cur.view(-1))
+            if scale != 1.0:
+                out.mul_(scale)
             return True
         geom = _tle_row_geom(1, n, cur.element_size())
-        plan = _tle_row_plan(1, n, n, cur.dtype, out.dtype, geom)
+        plan = _tle_row_plan(1, n, n, cur.dtype, out.dtype, geom, scale)
         _tle_row_reduce(cur.view(1, n), out.view(1), plan)
     return True
 
@@ -731,9 +736,9 @@ def _tle_sum_mid(inp, out, dims, N, scale=1.0):
     return True
 
 
-def _launch_sum_flat(inp, out, acc_dtype):
+def _launch_sum_flat(inp, out, acc_dtype, scale=1.0):
     """Exact flat reduction writing into `out` (0-d or (1,))."""
-    if not _tle_sum_flat(inp, out, acc_dtype):
+    if not _tle_sum_flat(inp, out, acc_dtype, scale):
         raise NotImplementedError(f"kunlunxin sum: no tle path for dtype {inp.dtype}")
 
 
